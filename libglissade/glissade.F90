@@ -1544,7 +1544,7 @@ contains
             model%options%bmlt_float_thermal_forcing_param, &
             model%options%ocean_data_extrapolate,  &
             model%options%deltaT_ocn_extrapolate,  &
-            parallel,                              &
+            parallel, model,                       &
             ewn,                nsn,               &
             dew*len0,           dns*len0,          & ! m
             itest,     jtest,   rtest,             &
@@ -4262,7 +4262,7 @@ contains
             model%options%bmlt_float_thermal_forcing_param, &
             model%options%ocean_data_extrapolate,     &
             model%options%deltaT_ocn_extrapolate,  &
-            parallel,                                 &
+            parallel, model,                          &
             ewn,       nsn,                           &
             model%numerics%dew*len0,                  &   ! m
             model%numerics%dns*len0,                  &   ! m

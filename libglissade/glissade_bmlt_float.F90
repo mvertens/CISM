@@ -723,7 +723,7 @@ module glissade_bmlt_float
        bmlt_float_thermal_forcing_param, &
        ocean_data_extrapolate,    &
        deltaT_ocn_extrapolate,    &
-       parallel,                  &
+       parallel, model,           &
        nx,        ny,             &
        dew,       dns,            &
        itest,     jtest,   rtest, &
@@ -758,7 +758,7 @@ module glissade_bmlt_float
 
     type(parallel_type), intent(in) :: &
          parallel                            !> info for parallel communication
-
+ 
     integer, intent(in) :: &
          nx, ny                              !> number of grid cells in each direction
 
@@ -795,6 +795,7 @@ module glissade_bmlt_float
                             !> basin_number = integer assigned to each basin
                             !> gamma0 = basal melt rate coefficient for ISMIP6 melt parameterization
                             !> deltaT_ocn = ocean temperature corrections for ISMIP6 melt parameterization
+    type(glide_global_type), intent(inout) :: model
 
     real(dp), dimension(:,:), intent(out) :: &
          bmlt_float         !> basal melt rate for floating ice (m/s)
@@ -854,7 +855,7 @@ module glissade_bmlt_float
 
     real(dp), parameter ::  &
          H0_float = 50.d0                 ! thickness scale (m) for floating ice; used to reduce weights when H < H0_float
-
+   
     if (verbose_bmlt_float .and. main_task) then
        print*, ' '
        print*, 'In subroutine glissade_bmlt_float_thermal_forcing'
@@ -989,7 +990,7 @@ module glissade_bmlt_float
  
        call glissade_thermal_forcing_extrapolate(&
             nx,        ny,                     &
-            parallel,                          &
+            parallel,  model,                  &
             itest,     jtest,     rtest,       &
             ocean_data%nzocn,                  &
             ocean_data%zocn,                   &  ! m
@@ -998,7 +999,7 @@ module glissade_bmlt_float
             thermal_forcing_mask,              &
             marine_connection_mask,            &
             unphys_val,                        &  ! identifies unfilled cells on input
-            unphys_val,                        &  ! default value given to unfilled cells on output
+            unphys_val,                       &  ! default value given to unfilled cells on output
             ocean_data%thermal_forcing)
 
        if (verbose_bmlt_float .and. this_rank == rtest) then
@@ -1451,7 +1452,7 @@ module glissade_bmlt_float
 
   subroutine glissade_thermal_forcing_extrapolate(&
        nx,              ny,                    &
-       parallel,                               &
+       parallel, model,                        &
        itest,           jtest,        rtest,   &
        nzocn,           zocn,                  &
        lsrf,            topg,                  &
@@ -1483,11 +1484,13 @@ module glissade_bmlt_float
     integer, intent(in) ::  &
          nx, ny,               & ! grid dimensions
          itest, jtest, rtest,  & ! coordinates of diagnostic point
-         nzocn                   ! number of ocean levels
-
+         nzocn                   ! number of ocean levels, number of iteration in smoothing
+              
     type(parallel_type), intent(in) :: &
          parallel                ! info for parallel communication
 
+    type(glide_global_type), intent(inout) ::  model
+    
     real(dp), dimension(nzocn), intent(in) :: &
          zocn                    ! ocean levels (m, negative below sea level)
 
@@ -1514,10 +1517,17 @@ module glissade_bmlt_float
     ! local variables
 
     real(dp), dimension(nzocn,nx,ny) :: &
-         phi                     ! temporary copy of thermal_forcing
+         phi, &                     ! temporary copy of thermal_forcing
+         phi1                       ! another copy
 
     integer, dimension(nzocn,nx,ny) :: &
-         mask                    ! = 1 for filled cells/levels, = 0 for unfilled cells/levels
+         mask, &                    ! = 1 for filled cells/levels, = 0 for unfilled cells/levels
+         unphys_mask                ! To select neighbour gridcells to smooth over, Michele
+ 
+    ! Note: This range ought to cover all regions where ice is present, but could be modified if desired.
+    real(dp), parameter ::  &
+         thermal_forcing_max = 20.d0,  &  ! max allowed value of thermal forcing (K)
+         thermal_forcing_min = -5.d0      ! min allowed value of thermal forcing (K)
 
     integer, dimension(nx,ny) ::  &
          ktop,                 & ! top ocean layer in a cell to be filled, if possible
@@ -1534,7 +1544,7 @@ module glissade_bmlt_float
          local_count,          & ! local counter for filled values
          global_count,         & ! global counter for filled values
          global_count_save       ! global counter for filled values from previous iteration
-
+  
     integer :: i, j, k, iter
     integer :: iglobal, jglobal
     integer :: kw, ke, ks, kn           ! ocean level in neighbor cells
@@ -1908,6 +1918,98 @@ module glissade_bmlt_float
           endif   ! thermal_forcing_mask
        enddo   ! i
     enddo   ! j
+ 
+    do j = 1, ny
+       do i = 1, nx
+          do k = 1, nzocn
+             if (thermal_forcing(k,i,j) == unphys_val) then
+                unphys_mask(k,i,j) = 0
+             else
+                unphys_mask(k,i,j) = 1
+             end if
+          end do
+       end do 
+    end do  
+
+    !Michele: simple attent to smooth extrapolated fields 
+     
+    if(model%options%smooth_extrapocean  == .true.) then
+      call write_log('Smoothing of extrapolated ocean data.')
+        
+    where(thermal_forcing > thermal_forcing_max .OR. thermal_forcing < thermal_forcing_min)
+            unphys_mask = 0
+    elsewhere
+            unphys_mask = 1
+    endwhere 
+    
+    call write_log('Number of iterations is ',model%options%smoothiter)
+
+    phi1 = thermal_forcing
+
+    do iter = 1, model%options%smoothiter
+
+    do j = nhalo+1, ny-nhalo
+         do i = nhalo+1, nx-nhalo
+            if (thermal_forcing_mask(i,j) == 1) then
+               do k = ktop(i,j), kbot(i,j)
+                  if(unphys_mask(k,i,j) == 1) then
+                    
+                     !Gaussian smoothing
+
+                     sum_mask = &
+                        1*unphys_mask(k,i-2,j-2) + 1*unphys_mask(k,i-2,j+2) + 1*unphys_mask(k,i+2,j-2) + 1*unphys_mask(k,i+2,j+2) + &
+                        4*unphys_mask(k,i-1,j-2) + 4*unphys_mask(k,i-2,j-1) + &
+                        4*unphys_mask(k,i+1,j-2) + 4*unphys_mask(k,i+2,j-1) + &
+                        4*unphys_mask(k,i+1,j+2) + 4*unphys_mask(k,i+2,j+1) + &
+                        4*unphys_mask(k,i-1,j+2) + 4*unphys_mask(k,i-2,j+1) + &
+                        7*unphys_mask(k,i-2,j) + 7*unphys_mask(k,i+2,j) + 7*unphys_mask(k,i,j-2) + 7*unphys_mask(k,i,j-2) + &
+                       16*unphys_mask(k,i-1,j-1) + 16*unphys_mask(k,i-1,j+1) + 16*unphys_mask(k,i+1,j-1) + 16*unphys_mask(k,i+1,j+1) + &
+                       26*unphys_mask(k,i-1,j) + 26*unphys_mask(k,i+1,j) + 26*unphys_mask(k,i,j-1) + 26*unphys_mask(k,i,j+1) + &  
+                       41*unphys_mask(k,i,j)       
+                
+                     sum_phi = 1*unphys_mask(k,i-2,j-2)*thermal_forcing(k,i-2,j-2)  +&
+                               1*unphys_mask(k,i-2,j+2)*thermal_forcing(k,i-2,j+2)  +&
+                               1*unphys_mask(k,i+2,j-2)*thermal_forcing(k,i+2,j-2)  +&
+                               1*unphys_mask(k,i+2,j+2)*thermal_forcing(k,i+2,j+2)  +&
+                               4*unphys_mask(k,i-1,j-2)*thermal_forcing(k,i-1,j-2)  +&
+                               4*unphys_mask(k,i-2,j-1)*thermal_forcing(k,i-2,j-1)  +&
+                               4*unphys_mask(k,i+1,j-2)*thermal_forcing(k,i+1,j-2)  +&
+                               4*unphys_mask(k,i+2,j-1)*thermal_forcing(k,i+2,j-1)  +&
+                               4*unphys_mask(k,i+1,j+2)*thermal_forcing(k,i+1,j+2)  +&
+                               4*unphys_mask(k,i+2,j+1)*thermal_forcing(k,i+2,j+1)  +&
+                               4*unphys_mask(k,i-1,j+2)*thermal_forcing(k,i-1,j+2)  +&
+                               4*unphys_mask(k,i-2,j+1)*thermal_forcing(k,i-2,j+1)  +&
+                               7*unphys_mask(k,i-2,j)*thermal_forcing(k,i-2,j)      +&
+                               7*unphys_mask(k,i+2,j)*thermal_forcing(k,i+2,j)      +&
+                               7*unphys_mask(k,i,j-2)*thermal_forcing(k,i,j-2)      +&
+                               7*unphys_mask(k,i,j-2)*thermal_forcing(k,i,j-2)      +&
+                               16*unphys_mask(k,i-1,j-1)*thermal_forcing(k,i-1,j-1) +&  
+                               16*unphys_mask(k,i-1,j+1)*thermal_forcing(k,i-1,j+1) +&
+                               16*unphys_mask(k,i+1,j-1)*thermal_forcing(k,i+1,j-1) +&
+                               16*unphys_mask(k,i+1,j+1)*thermal_forcing(k,i+1,j+1) +&
+                               26*unphys_mask(k,i-1,j)*thermal_forcing(k,i-1,j)     +&
+                               26*unphys_mask(k,i+1,j)*thermal_forcing(k,i+1,j)     +&
+                               26*unphys_mask(k,i,j-1)*thermal_forcing(k,i,j-1)     +&
+                               26*unphys_mask(k,i,j+1)*thermal_forcing(k,i,j+1)     +&
+                               41*unphys_mask(k,i,j)*thermal_forcing(k,i,j)                         
+
+                     phi1(k,i,j) = sum_phi / real(sum_mask,dp)
+               
+                  end if !mask(k,j,i) == 1
+               end do ! k
+            end if !thermal_forcing_mask == 1
+         end do ! i
+      end do ! j
+
+      call parallel_halo(thermal_forcing, parallel)
+  
+      thermal_forcing = phi1
+
+      end do !iter 
+      else
+          call write_log('No smoothing of extrapolated ocean data.' // &
+                  'Double check this is the behaviour wanted.')
+      end if !model%options%smooth_extrapocean == .true.
 
     ! Set the thermal forcing to a default value in the remaining unfilled cell/levels.
     ! For example, we might set thermal_forcing = 0 to get cleaner diagnostics.
